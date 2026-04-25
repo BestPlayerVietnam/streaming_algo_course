@@ -10,7 +10,7 @@ var ErrNotFound = errors.New("skiplist: ключ не найден")
 
 const (
 	maxLevel    = 32  // log2(2^32) — хватит для 4 млрд ключей
-	probability = 0.8 // вероятность "подъёма" на следующий уровень
+	probability = 0.5 // вероятность "подъёма" на следующий уровень
 )
 
 // node — узел SkipList. forward[i] указывает на следующий узел на уровне i.
@@ -30,10 +30,11 @@ type Iterator interface {
 // SkipList — In-Memory движок для HLR.
 // Обеспечивает O(log N) на чтение/запись и упорядоченный доступ.
 type SkipList struct {
-	head  *node      // сентинел-узел с forward на maxLevel
-	level int        // текущий максимальный занятый уровень (1..maxLevel)
-	rng   *rand.Rand // детерминированный RNG из seed
-	size  int        // количество ключей
+	head      *node      // сентинел-узел с forward на maxLevel
+	level     int        // текущий максимальный занятый уровень (1..maxLevel)
+	rng       *rand.Rand // детерминированный RNG из seed
+	size      int        // количество ключей
+	bytesUsed int        // суммарный размер ключей и значений в байтах (для триггера флаша в LSM)
 }
 
 // New создаёт SkipList. seed требуется для детерминируемых тестов (воспроизводимость поведения при ошибках).
@@ -73,6 +74,7 @@ func (s *SkipList) Put(key, value []byte) error {
 
 	// Фаза 2: если ключ уже есть — обновляем значение и выходим.
 	if next := x.forward[0]; next != nil && bytes.Equal(next.key, key) {
+		s.bytesUsed += len(value) - len(next.value)   // дельта по значению, ключ не меняется
 		next.value = append(next.value[:0], value...) // защитная копия
 		return nil
 	}
@@ -106,6 +108,7 @@ func (s *SkipList) Put(key, value []byte) error {
 	}
 
 	s.size++
+	s.bytesUsed += len(key) + len(value)
 	return nil
 }
 
@@ -159,7 +162,12 @@ func (s *SkipList) Delete(key []byte) error {
 	}
 
 	s.size--
+	s.bytesUsed -= len(target.key) + len(target.value)
 	return nil
+}
+
+func (s *SkipList) BytesUsed() int {
+	return s.bytesUsed
 }
 
 // scanIterator — ленивый итератор по диапазону [start, end).
