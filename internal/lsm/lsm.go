@@ -72,10 +72,18 @@ type Options struct {
 	// Максимальный размер Memtable перед сбросом на диск (Flush).
 	// 0 → значение по умолчанию (1 MiB).
 	MemtableFlushThreshold int
+	// CompactionThreshold — количество SSTable, при достижении которого
+	// запускается compaction (слияние всех в один новый файл).
+	// 0 → значение по умолчанию (4).
+	// Установка значения 0xFFFFFFFF фактически отключает compaction.
+	CompactionThreshold int
 }
 
 // defaultMemtableThreshold — 1 MiB, как в задании.
-const defaultMemtableThreshold = 1 * 1024 * 1024
+const (
+	defaultMemtableThreshold   = 1 * 1024 * 1024
+	defaultCompactionThreshold = 4
+)
 
 // Engine — LSM движок (Memtable + WAL; на этом шаге без SSTable, без compaction).
 //
@@ -108,7 +116,9 @@ func Open(opts Options) (*Engine, error) {
 	if opts.MemtableFlushThreshold <= 0 {
 		opts.MemtableFlushThreshold = defaultMemtableThreshold
 	}
-
+	if opts.CompactionThreshold <= 0 {
+		opts.CompactionThreshold = defaultCompactionThreshold
+	}
 	if err := os.MkdirAll(opts.Dir, 0o755); err != nil {
 		return nil, fmt.Errorf("lsm: mkdir %s: %w", opts.Dir, err)
 	}
@@ -453,7 +463,16 @@ func (e *Engine) maybeFlushLocked() error {
 	if e.mem.BytesUsed() < e.opts.MemtableFlushThreshold {
 		return nil
 	}
-	return e.flushLocked()
+	if err := e.flushLocked(); err != nil {
+		return err
+	}
+	return e.maybeCompactLocked()
+}
+func (e *Engine) maybeCompactLocked() error {
+	if len(e.sstables) < e.opts.CompactionThreshold {
+		return nil
+	}
+	return e.compactAllLocked()
 }
 
 // flushLocked сбрасывает текущую Memtable в новый SSTable файл.
@@ -547,6 +566,212 @@ func (e *Engine) rotateWALLocked() error {
 	e.walPath = newPath
 	e.walSeq = newSeq
 	return nil
+}
+
+// compactAllLocked сливает все текущие SSTable в один новый.
+// Реализует стратегию "слить всё L0": берём все файлы, мерджим k-way,
+// выбрасываем устаревшие версии (по возрастанию seq → старее) и tombstone'ы
+// (поскольку ниже уровней нет).
+//
+// Шаги (атомарно как и flushLocked):
+//  1. Записать новый SSTable во временный файл .tmp + Sync.
+//  2. Rename во финальное имя.
+//  3. Закрыть и удалить старые SSTable (с диска).
+//  4. Заменить e.sstables на список с одним новым SSTable.
+//
+// Падение на шагах 1–2 → .tmp удалится при следующем Open.
+// Падение между 2 и 3 → на диске будет и новый SSTable, и старые. При следующем
+//
+//	Open мы их все откроем; новый SSTable со свежим seq будет «выигрывать» при Get,
+//	старые — избыточные данные. Они уйдут при следующем compaction.
+func (e *Engine) compactAllLocked() error {
+	if len(e.sstables) < 2 {
+		return nil
+	}
+
+	seq := e.nextSeq
+	e.nextSeq++
+
+	finalPath := filepath.Join(e.opts.Dir, sstFileName(seq))
+	tmpPath := finalPath + ".tmp"
+
+	if err := mergeSSTables(e.sstables, tmpPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("lsm: compact merge: %w", err)
+	}
+
+	if err := os.Rename(tmpPath, finalPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("lsm: compact rename: %w", err)
+	}
+
+	// Открыть новый SSTable.
+	f, err := os.Open(finalPath)
+	if err != nil {
+		return fmt.Errorf("lsm: compact reopen: %w", err)
+	}
+	stat, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return fmt.Errorf("lsm: compact stat: %w", err)
+	}
+	rd, err := sstable.NewReader(f, stat.Size())
+	if err != nil {
+		f.Close()
+		return fmt.Errorf("lsm: compact reader: %w", err)
+	}
+	newHandle := &sstableHandle{seq: seq, path: finalPath, file: f, reader: rd}
+
+	// Закрыть и удалить старые SSTable.
+	oldHandles := e.sstables
+	e.sstables = []*sstableHandle{newHandle}
+	for _, h := range oldHandles {
+		_ = h.Close()
+		if err := os.Remove(h.path); err != nil && !os.IsNotExist(err) {
+			// Не фатально: при следующем Open лишние файлы не помешают, но
+			// засорят директорию. Логировать пока некуда — просто игнорируем.
+		}
+	}
+
+	return nil
+}
+
+// sourceIter — источник для k-way merge: итератор + sequence (seq больше = свежее).
+type sourceIter struct {
+	seq    uint64
+	it     *sstable.Iter
+	hasCur bool
+	curK   []byte
+	curV   []byte
+}
+
+// advance читает следующую запись из итератора.
+// Возвращает true, если запись прочитана; false при конце источника.
+func (s *sourceIter) advance() (bool, error) {
+	k, v, ok, err := s.it.Next()
+	if err != nil {
+		s.hasCur = false
+		return false, err
+	}
+	if !ok {
+		s.hasCur = false
+		return false, nil
+	}
+	s.curK = k
+	s.curV = v
+	s.hasCur = true
+	return true, nil
+}
+
+// mergeSSTables сливает n SSTable в один файл по пути out.
+// Дубликаты ключей разрешаются: побеждает запись из источника с большим seq.
+// Tombstone'ы физически удаляются (мы — последний уровень).
+func mergeSSTables(sources []*sstableHandle, out string) error {
+	// Открыть итераторы по всем источникам. Каждый — по полному диапазону.
+	iters := make([]*sourceIter, 0, len(sources))
+	for _, s := range sources {
+		it, err := s.reader.Iterator(nil, nil)
+		if err != nil {
+			for _, opened := range iters {
+				_ = opened.it.Close()
+			}
+			return fmt.Errorf("open iter seq=%d: %w", s.seq, err)
+		}
+		si := &sourceIter{seq: s.seq, it: it}
+		if _, err := si.advance(); err != nil {
+			it.Close()
+			for _, opened := range iters {
+				_ = opened.it.Close()
+			}
+			return err
+		}
+		iters = append(iters, si)
+	}
+	defer func() {
+		for _, s := range iters {
+			_ = s.it.Close()
+		}
+	}()
+
+	// Открыть выходной файл и Writer.
+	f, err := os.OpenFile(out, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return fmt.Errorf("create out: %w", err)
+	}
+	defer f.Close()
+
+	w := sstable.NewWriter(f)
+
+	// Простой O(n*k) merge: на каждом шаге линейно ищем минимальный ключ
+	// среди ещё активных источников. n обычно небольшое (4–8 файлов),
+	// и куча тут переусложнила бы код. Если когда-нибудь окажется горячо —
+	// заменим на container/heap.
+	for {
+		// Собрать активные источники с минимальным ключом.
+		var minKey []byte
+		var participants []*sourceIter
+		for _, s := range iters {
+			if !s.hasCur {
+				continue
+			}
+			if minKey == nil || bytesLess(s.curK, minKey) {
+				minKey = s.curK
+				participants = participants[:0]
+				participants = append(participants, s)
+			} else if bytesEqual(s.curK, minKey) {
+				participants = append(participants, s)
+			}
+		}
+		if len(participants) == 0 {
+			break // все источники исчерпаны
+		}
+
+		// Среди дубликатов выбрать запись из самого свежего источника.
+		winner := participants[0]
+		for _, p := range participants[1:] {
+			if p.seq > winner.seq {
+				winner = p
+			}
+		}
+
+		// Решить: писать ли запись в выход.
+		// Tombstone не пишем, потому что ниже уровней нет — физически удаляем.
+		_, isPut := decodeValue(winner.curV)
+		if isPut {
+			if err := w.Add(append([]byte(nil), winner.curK...), append([]byte(nil), winner.curV...)); err != nil {
+				return fmt.Errorf("sst add: %w", err)
+			}
+		}
+
+		// Продвинуть все источники, у которых был этот ключ — независимо от того, кто выиграл.
+		for _, p := range participants {
+			if _, err := p.advance(); err != nil {
+				return err
+			}
+		}
+	}
+
+	if err := w.Close(); err != nil {
+		return fmt.Errorf("sst close: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("sync: %w", err)
+	}
+	return nil
+}
+
+// bytesLess — bytes.Compare(a, b) < 0 без импорта "bytes".
+func bytesLess(a, b []byte) bool {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	for i := 0; i < n; i++ {
+		if a[i] != b[i] {
+			return a[i] < b[i]
+		}
+	}
+	return len(a) < len(b)
 }
 
 // writeMemtableToSSTable итерирует Memtable в порядке возрастания ключей
@@ -652,6 +877,15 @@ func (e *Engine) Close() error {
 	if e.mem.BytesUsed() > 0 {
 		if err := e.flushLocked(); err != nil && firstErr == nil {
 			firstErr = fmt.Errorf("lsm: final flush: %w", err)
+		}
+	}
+
+	// Опционально: если после финального флаша SSTable много —
+	// можно скомпактить, чтобы при следующем Open было меньше файлов.
+	// Это не обязательно для корректности, но удобно для тестов и Compaction Test.
+	if firstErr == nil && len(e.sstables) >= e.opts.CompactionThreshold {
+		if err := e.compactAllLocked(); err != nil {
+			firstErr = fmt.Errorf("lsm: final compact: %w", err)
 		}
 	}
 
