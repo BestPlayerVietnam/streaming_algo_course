@@ -113,20 +113,29 @@ func Open(opts Options) (*Engine, error) {
 		return nil, fmt.Errorf("lsm: mkdir %s: %w", opts.Dir, err)
 	}
 
-	// Чистим возможные .tmp файлы от незавершённого флаша.
 	if err := cleanupTmp(opts.Dir); err != nil {
 		return nil, fmt.Errorf("lsm: cleanup tmp: %w", err)
 	}
 
-	// Открываем существующие SSTable.
+	// 1. Открыть существующие SSTable.
 	ssts, maxSstSeq, err := openExistingSSTables(opts.Dir)
 	if err != nil {
 		return nil, err
 	}
 
-	// На этом шаге recovery WAL пока без эффекта (пустая Memtable).
-	// Полноценное восстановление из WAL — Шаг 3.
-	walSeq := maxSstSeq + 1
+	// 2. Восстановить Memtable из всех существующих WAL.
+	mem, oldWALPaths, maxWalSeq, err := recoverFromWALs(opts.Dir)
+	if err != nil {
+		closeAllSSTables(ssts)
+		return nil, fmt.Errorf("lsm: wal recovery: %w", err)
+	}
+
+	// 3. Выбрать sequence для нового WAL — больше всех существующих файлов.
+	maxSeq := maxSstSeq
+	if maxWalSeq > maxSeq {
+		maxSeq = maxWalSeq
+	}
+	walSeq := maxSeq + 1
 	walPath := filepath.Join(opts.Dir, walFileName(walSeq))
 	f, err := os.OpenFile(walPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
@@ -134,9 +143,15 @@ func Open(opts Options) (*Engine, error) {
 		return nil, fmt.Errorf("lsm: open wal: %w", err)
 	}
 
+	// 4. Удалить старые WAL только после успешного открытия нового.
+	//    Если упадём здесь — в следующий Open старые WAL отработают повторно (идемпотентно).
+	for _, p := range oldWALPaths {
+		_ = os.Remove(p)
+	}
+
 	e := &Engine{
 		opts:     opts,
-		mem:      skiplist.New(0),
+		mem:      mem,
 		wal:      wal.NewWriter(f),
 		walFile:  f,
 		walPath:  walPath,
@@ -249,6 +264,80 @@ func openExistingSSTables(dir string) ([]*sstableHandle, uint64, error) {
 		handles = append(handles, &sstableHandle{seq: p.seq, path: p.path, file: f, reader: r})
 	}
 	return handles, maxSeq, nil
+}
+
+// recoverFromWALs читает все WAL-файлы в директории по возрастанию seq,
+// накатывает их записи в новую Memtable и возвращает её, список прочитанных
+// путей (для последующего удаления) и максимальный seq.
+func recoverFromWALs(dir string) (*skiplist.SkipList, []string, uint64, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, nil, 0, fmt.Errorf("readdir: %w", err)
+	}
+
+	type pending struct {
+		seq  uint64
+		path string
+	}
+	var pendings []pending
+	var maxSeq uint64
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		seq, ok := parseSeqFromName(e.Name(), "wal-", ".log")
+		if !ok {
+			continue
+		}
+		pendings = append(pendings, pending{seq: seq, path: filepath.Join(dir, e.Name())})
+		if seq > maxSeq {
+			maxSeq = seq
+		}
+	}
+	sort.Slice(pendings, func(i, j int) bool { return pendings[i].seq < pendings[j].seq })
+
+	mem := skiplist.New(0)
+	paths := make([]string, 0, len(pendings))
+	for _, p := range pendings {
+		if err := replayWAL(mem, p.path); err != nil {
+			return nil, nil, 0, fmt.Errorf("replay %s: %w", p.path, err)
+		}
+		paths = append(paths, p.path)
+	}
+	return mem, paths, maxSeq, nil
+}
+
+// replayWAL читает один WAL-файл и применяет записи к Memtable.
+// Использует штатный wal.Reader: torn writes на хвосте трактуются как конец лога.
+func replayWAL(mem *skiplist.SkipList, path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	r := wal.NewReader(f)
+	for {
+		rec, ok, err := r.Next()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
+		switch rec.Type {
+		case wal.OpPut:
+			if err := mem.Put(rec.Key, encodeValue(tagPut, rec.Value)); err != nil {
+				return fmt.Errorf("memtable put: %w", err)
+			}
+		case wal.OpDelete:
+			if err := mem.Put(rec.Key, encodeValue(tagDelete, nil)); err != nil {
+				return fmt.Errorf("memtable put: %w", err)
+			}
+		default:
+			return fmt.Errorf("unknown op: %d", rec.Type)
+		}
+	}
 }
 
 func closeAllSSTables(hs []*sstableHandle) {
@@ -583,6 +672,34 @@ func (e *Engine) Close() error {
 	}
 	e.sstables = nil
 
+	return firstErr
+}
+
+// crashClose имитирует «жёсткое» выключение: закрывает все file handles
+// без флаша Memtable и без удаления старого WAL. Используется только в тестах
+// для проверки crash recovery — в нормальной работе всегда вызывается Close.
+//
+// После crashClose Engine непригоден для дальнейшего использования.
+func (e *Engine) crashClose() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.closed {
+		return nil
+	}
+	e.closed = true
+
+	var firstErr error
+	// Только закрываем файлы — никаких флашей и удалений.
+	if err := e.walFile.Close(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	for _, h := range e.sstables {
+		if err := h.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	e.sstables = nil
 	return firstErr
 }
 

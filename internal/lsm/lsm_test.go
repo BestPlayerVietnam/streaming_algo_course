@@ -259,3 +259,107 @@ func TestLSM_TombstoneAcrossLevels(t *testing.T) {
 		t.Fatalf("Get удалённого ключа: ожидали ErrNotFound, получили %v", err)
 	}
 }
+
+// TestLSM_RecoveryFromWAL_NoFlush проверяет crash recovery без чистого Close:
+// данные есть только в WAL (Memtable никогда не флашилась). При повторном Open
+// они должны вернуться через replay.
+func TestLSM_RecoveryFromWAL_NoFlush(t *testing.T) {
+	ctx := context.Background()
+	dir := filepath.Join(t.TempDir(), "db")
+
+	e, err := Open(Options{Dir: dir, MemtableFlushThreshold: 1 << 30}) // огромный порог — никогда не флашить
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	if err := e.Put(ctx, []byte("k1"), []byte("v1")); err != nil {
+		t.Fatalf("Put k1: %v", err)
+	}
+	if err := e.Put(ctx, []byte("k2"), []byte("v2")); err != nil {
+		t.Fatalf("Put k2: %v", err)
+	}
+	if err := e.Delete(ctx, []byte("k1")); err != nil {
+		t.Fatalf("Delete k1: %v", err)
+	}
+
+	// Имитация kill -9: закрываем дескрипторы без флаша и без graceful shutdown.
+	if err := e.crashClose(); err != nil {
+		t.Fatalf("crashClose: %v", err)
+	}
+
+	// Повторный Open: WAL должен быть прочитан, Memtable восстановлена.
+	e2, err := Open(Options{Dir: dir, MemtableFlushThreshold: 1 << 30})
+	if err != nil {
+		t.Fatalf("Open2: %v", err)
+	}
+	defer e2.Close()
+
+	// k1 удалён → ErrNotFound.
+	if _, err := e2.Get(ctx, []byte("k1")); !errors.Is(err, ErrNotFound) {
+		t.Errorf("k1 после recovery: ожидали ErrNotFound, получили %v", err)
+	}
+	// k2 — Put-запись, должна быть восстановлена.
+	got, err := e2.Get(ctx, []byte("k2"))
+	if err != nil {
+		t.Fatalf("k2: %v", err)
+	}
+	if string(got) != "v2" {
+		t.Fatalf("k2: got=%q want=%q", got, "v2")
+	}
+}
+
+func TestLSM_RecoveryFromWAL_AfterFlush(t *testing.T) {
+	ctx := context.Background()
+	dir := filepath.Join(t.TempDir(), "db")
+
+	e, err := Open(Options{Dir: dir, MemtableFlushThreshold: 4 * 1024})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	// Заполняем Memtable до флаша.
+	bigVal := bytes.Repeat([]byte("x"), 1024)
+	for i := 0; i < 10; i++ {
+		if err := e.Put(ctx, []byte{byte('A' + i)}, bigVal); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+	if len(e.sstables) == 0 {
+		t.Fatal("ожидали флаш")
+	}
+
+	// После флаша добавляем ещё пару записей — они только в новом WAL.
+	if err := e.Put(ctx, []byte("after_flush"), []byte("post")); err != nil {
+		t.Fatalf("Put after flush: %v", err)
+	}
+
+	// Имитация краша.
+	if err := e.crashClose(); err != nil {
+		t.Fatalf("crashClose: %v", err)
+	}
+
+	// Recovery.
+	e2, err := Open(Options{Dir: dir, MemtableFlushThreshold: 4 * 1024})
+	if err != nil {
+		t.Fatalf("Open2: %v", err)
+	}
+	defer e2.Close()
+
+	// Старая запись из SSTable.
+	got, err := e2.Get(ctx, []byte("A"))
+	if err != nil {
+		t.Fatalf("Get A: %v", err)
+	}
+	if !bytes.Equal(got, bigVal) {
+		t.Errorf("A: значение не совпадает")
+	}
+
+	// Запись из WAL после флаша.
+	got, err = e2.Get(ctx, []byte("after_flush"))
+	if err != nil {
+		t.Fatalf("Get after_flush: %v", err)
+	}
+	if string(got) != "post" {
+		t.Fatalf("after_flush: got=%q want=%q", got, "post")
+	}
+}
