@@ -53,10 +53,31 @@ func (s *Store) Delete(ctx context.Context, key []byte) error {
 }
 
 // Scan возвращает упорядоченный итератор по диапазону [start, end).
-// Сейчас Scan не реализован в lsm.Engine — возвращаем kv.ErrNotImplemented.
-// Это допустимо: интерфейс kv.Store его требует, но тесты Дня 2 его не используют.
+// Адаптирует lsm.Iterator (Pair) к kv.Iterator (Pair).
 func (s *Store) Scan(ctx context.Context, start, end []byte) (kv.Iterator, error) {
-	return nil, kv.ErrNotImplemented
+	it, err := s.engine.Scan(ctx, start, end)
+	if err != nil {
+		return nil, err
+	}
+	return &iteratorAdapter{inner: it}, nil
+}
+
+// iteratorAdapter переводит lsm.Iterator в kv.Iterator.
+// Структуры Pair у нас совместимые по форме, но это разные типы.
+type iteratorAdapter struct {
+	inner lsm.Iterator
+}
+
+func (a *iteratorAdapter) Next() (kv.Pair, bool, error) {
+	p, ok, err := a.inner.Next()
+	if err != nil || !ok {
+		return kv.Pair{}, false, err
+	}
+	return kv.Pair{Key: p.Key, Value: p.Value}, true, nil
+}
+
+func (a *iteratorAdapter) Close() error {
+	return a.inner.Close()
 }
 
 // Close завершает работу стора (флаш Memtable, закрытие WAL и SSTable).

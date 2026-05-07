@@ -1,6 +1,7 @@
 package lsm
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -455,6 +456,242 @@ func (e *Engine) Get(ctx context.Context, key []byte) ([]byte, error) {
 	}
 
 	return nil, ErrNotFound
+}
+
+// Pair — пара (ключ, значение) для итерации.
+type Pair struct {
+	Key   []byte
+	Value []byte
+}
+
+// Iterator — упорядоченная итерация по диапазону ключей хранилища.
+// Семантика:
+//
+//	Next возвращает (Pair, true) пока данные есть; (Pair{}, false) — конец.
+//	Pair.Key/Value — независимые копии, безопасны для использования после Next.
+//	Tombstone'ы скрыты от пользователя.
+//	Close можно вызывать многократно.
+type Iterator interface {
+	Next() (Pair, bool, error)
+	Close() error
+}
+
+// Scan возвращает упорядоченный итератор по диапазону [start, end).
+// start == nil — с самого первого ключа; end == nil — до последнего.
+//
+// Реализация: k-way merge между Memtable и всеми SSTable. Для каждого
+// уникального ключа выбирается запись из самого свежего источника
+// (приоритет: Memtable > SSTable от большего seq к меньшему). Если
+// победившая запись — tombstone, ключ пропускается.
+//
+// Snapshot semantics: итератор берёт снапшот списка SSTable и Memtable
+// на момент вызова Scan. Конкурентные Put после этого не будут видны
+// в результатах. Это упрощение; production-LSM делают MVCC.
+func (e *Engine) Scan(ctx context.Context, start, end []byte) (Iterator, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	if e.closed {
+		return nil, ErrClosed
+	}
+
+	// Снапшот источников: Memtable + все SSTable.
+	// Приоритет: чем больше priority — тем свежее источник.
+	// Memtable = max+1 (свежее всех SSTable).
+
+	memIt, err := e.mem.Scan(start, end)
+	if err != nil {
+		return nil, fmt.Errorf("lsm: scan memtable: %w", err)
+	}
+
+	sources := make([]*scanSource, 0, len(e.sstables)+1)
+
+	// Memtable — первый источник, наивысший приоритет.
+	memSrc := &scanSource{
+		priority: uint64(len(e.sstables)) + 1,
+		mem:      memIt,
+	}
+	if _, err := memSrc.advance(); err != nil {
+		memIt.Close()
+		return nil, err
+	}
+	sources = append(sources, memSrc)
+
+	// SSTable — приоритет = seq (больший seq = свежее).
+	for _, h := range e.sstables {
+		ssIt, err := h.reader.Iterator(start, end)
+		if err != nil {
+			// Закрыть всё уже открытое.
+			for _, s := range sources {
+				_ = s.close()
+			}
+			return nil, fmt.Errorf("lsm: scan sst seq=%d: %w", h.seq, err)
+		}
+		src := &scanSource{
+			priority: h.seq,
+			sst:      ssIt,
+		}
+		if _, err := src.advance(); err != nil {
+			ssIt.Close()
+			for _, s := range sources {
+				_ = s.close()
+			}
+			return nil, err
+		}
+		sources = append(sources, src)
+	}
+
+	return &mergeIterator{sources: sources, end: end}, nil
+}
+
+// scanSource — обобщённый источник для k-way merge:
+// либо memtable-итератор, либо SSTable-итератор. Голова текущей записи кешируется.
+type scanSource struct {
+	priority uint64
+
+	// Ровно один из них не nil:
+	mem skiplist.Iterator
+	sst *sstable.Iter
+
+	hasCur bool
+	curK   []byte
+	curV   []byte // ВНУТРЕННЕЕ представление (с тегом)
+}
+
+// advance читает следующую запись источника.
+func (s *scanSource) advance() (bool, error) {
+	if s.mem != nil {
+		k, v, ok, err := s.mem.Next()
+		if err != nil {
+			s.hasCur = false
+			return false, err
+		}
+		if !ok {
+			s.hasCur = false
+			return false, nil
+		}
+		s.curK = append(s.curK[:0], k...)
+		s.curV = append(s.curV[:0], v...)
+		s.hasCur = true
+		return true, nil
+	}
+	// sst != nil
+	k, v, ok, err := s.sst.Next()
+	if err != nil {
+		s.hasCur = false
+		return false, err
+	}
+	if !ok {
+		s.hasCur = false
+		return false, nil
+	}
+	// sst.Iter уже отдаёт копии (см. реализацию SSTable Iter.Next).
+	s.curK = k
+	s.curV = v
+	s.hasCur = true
+	return true, nil
+}
+
+func (s *scanSource) close() error {
+	if s.mem != nil {
+		err := s.mem.Close()
+		s.mem = nil
+		return err
+	}
+	if s.sst != nil {
+		err := s.sst.Close()
+		s.sst = nil
+		return err
+	}
+	return nil
+}
+
+// mergeIterator реализует Iterator поверх нескольких scanSource.
+type mergeIterator struct {
+	sources []*scanSource
+	end     []byte
+	closed  bool
+}
+
+func (it *mergeIterator) Next() (Pair, bool, error) {
+	if it.closed {
+		return Pair{}, false, errors.New("lsm: iterator closed")
+	}
+
+	// Цикл: возможно, придётся пропустить tombstone'ы и выйти на следующую запись.
+	for {
+		// Найти источники с минимальным ключом среди активных.
+		var minKey []byte
+		var participants []*scanSource
+		for _, s := range it.sources {
+			if !s.hasCur {
+				continue
+			}
+			if minKey == nil || bytes.Compare(s.curK, minKey) < 0 {
+				minKey = s.curK
+				participants = participants[:0]
+				participants = append(participants, s)
+			} else if bytes.Equal(s.curK, minKey) {
+				participants = append(participants, s)
+			}
+		}
+		if len(participants) == 0 {
+			return Pair{}, false, nil
+		}
+
+		// Проверка верхней границы (на случай, если итераторы источников
+		// её не учли — для memtable.Scan с end учитывается, но подстрахуемся).
+		if it.end != nil && bytes.Compare(minKey, it.end) >= 0 {
+			return Pair{}, false, nil
+		}
+
+		// Выбрать победителя по приоритету (наивысший = самый свежий).
+		winner := participants[0]
+		for _, p := range participants[1:] {
+			if p.priority > winner.priority {
+				winner = p
+			}
+		}
+
+		// Запомнить значение и продвинуть все источники с этим ключом.
+		// Делаем копии, так как curK/curV могут быть переиспользованы при advance.
+		key := append([]byte(nil), winner.curK...)
+		internalVal := append([]byte(nil), winner.curV...)
+
+		for _, p := range participants {
+			if _, err := p.advance(); err != nil {
+				return Pair{}, false, err
+			}
+		}
+
+		// Декодировать. Tombstone — пропускаем (не выдаём наружу) и идём на следующую итерацию.
+		val, isPut := decodeValue(internalVal)
+		if !isPut {
+			continue
+		}
+
+		// Возврат: ещё одна копия value (без tag-байта).
+		valCopy := make([]byte, len(val))
+		copy(valCopy, val)
+		return Pair{Key: key, Value: valCopy}, true, nil
+	}
+}
+
+func (it *mergeIterator) Close() error {
+	if it.closed {
+		return nil
+	}
+	it.closed = true
+	var firstErr error
+	for _, s := range it.sources {
+		if err := s.close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // maybeFlushLocked флашит Memtable в SSTable, если она переросла порог.

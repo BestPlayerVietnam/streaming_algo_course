@@ -770,3 +770,50 @@ func formatKey6(i int) string {
 	}
 	return string(buf)
 }
+
+// TestLSMStore_ScanBasic — простая проверка адаптера Scan.
+// Сложные сценарии тестируются на уровне lsm.Engine; здесь только адаптация типов.
+func TestLSMStore_ScanBasic(t *testing.T) {
+	ctx := context.Background()
+	dir := filepath.Join(t.TempDir(), "db")
+
+	s, err := Open(Options{Dir: dir})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	for _, k := range []string{"banana", "apple", "cherry"} {
+		if err := s.Put(ctx, []byte(k), []byte("v_"+k)); err != nil {
+			t.Fatalf("Put %s: %v", k, err)
+		}
+	}
+
+	it, err := s.Scan(ctx, nil, nil)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	defer it.Close()
+
+	var got []string
+	for {
+		p, ok, err := it.Next()
+		if err != nil {
+			t.Fatalf("Next: %v", err)
+		}
+		if !ok {
+			break
+		}
+		got = append(got, string(p.Key))
+	}
+
+	want := []string{"apple", "banana", "cherry"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("[%d]: got=%q want=%q", i, got[i], want[i])
+		}
+	}
+}
